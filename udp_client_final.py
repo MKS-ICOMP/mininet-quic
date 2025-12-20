@@ -17,8 +17,8 @@ import time
 SERVER_IP = "10.0.0.1"
 SERVER_PORT = 4433
 
-TIMEOUT = 1.0       # timeout para esperar ACK
-MAX_RETRIES = 3     # retransmissões por pacote
+TIMEOUT = 0.0       # timeout para esperar ACK
+MAX_RETRIES = 5     # retransmissões por pacote
 NUM_DATA_PKTS = 5   # quantos pacotes de dados enviar
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
