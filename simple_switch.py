@@ -1,6 +1,6 @@
-# simple_switch_fixed.py
-# Reinstala a regra Table-Miss após limpar fluxos.
-# Isso garante que o switch continue falando com o controlador após mudanças no STP.
+# simple_switch_route.py
+# Força rota SUPERIOR (s1-s2-s4) manipulando prioridades do STP.
+# Mantém correções de "Table-Miss" e "Flood Nativo".
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -10,16 +10,32 @@ from ryu.lib.packet import packet, ethernet, arp
 from ryu.lib import stplib
 from ryu.lib import dpid as dpid_lib
 
-class SimpleSwitchFixed(app_manager.RyuApp):
+class SimpleSwitchRoute(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _CONTEXTS = {'stplib': stplib.Stp}
 
     def __init__(self, *args, **kwargs):
-        super(SimpleSwitchFixed, self).__init__(*args, **kwargs)
+        super(SimpleSwitchRoute, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.stp = kwargs['stplib']
         self.port_state = {}
-        self.logger.info(">>> INICIANDO: Correção da Table-Miss aplicada <<<")
+
+        # --- CONFIGURAÇÃO DE ROTA FORÇADA ---
+        # Lógica: O STP escolhe o caminho através dos switches com menor prioridade.
+        # S1 (0x1000): Raiz Absoluta.
+        # S2 (0x2000): Prioridade Alta -> STP vai preferir este caminho.
+        # S3 (0x9000): Prioridade Baixa -> STP vai evitar/bloquear este caminho.
+        # S4 (0x8000): Padrão.
+        # Resultado: O fluxo fluirá S1 -> S2 -> S4.
+        
+        config = {
+            dpid_lib.str_to_dpid('0000000000000001'): {'bridge': {'priority': 0x1000}},
+            dpid_lib.str_to_dpid('0000000000000002'): {'bridge': {'priority': 0x2000}},
+            dpid_lib.str_to_dpid('0000000000000003'): {'bridge': {'priority': 0x9000}},
+            dpid_lib.str_to_dpid('0000000000000004'): {'bridge': {'priority': 0x8000}}
+        }
+        self.stp.set_config(config)
+        self.logger.info(">>> ROTA FORÇADA: S1 -> S2 -> S4 (Via Prioridades STP) <<<")
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -33,8 +49,8 @@ class SimpleSwitchFixed(app_manager.RyuApp):
                                     match=match, instructions=inst)
         datapath.send_msg(mod)
 
-    # Função auxiliar para instalar a regra padrão (Enviar ao Controller)
     def add_table_miss_flow(self, datapath):
+        """Reinstala regra para enviar pacotes desconhecidos ao controlador"""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         match = parser.OFPMatch()
@@ -44,26 +60,20 @@ class SimpleSwitchFixed(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
-        # Instala a regra Table-Miss quando o switch conecta pela primeira vez
         self.add_table_miss_flow(datapath)
         self.logger.info(f"⚪ Switch Conectado: {dpid_lib.dpid_to_str(datapath.id)}")
 
     @set_ev_cls(stplib.EventTopologyChange, MAIN_DISPATCHER)
     def _topology_change_handler(self, ev):
         dp = ev.dp
-        dpid_str = dpid_lib.dpid_to_str(dp.id)
-        
-        # 1. Limpa TODOS os fluxos antigos
+        # Limpa fluxos
         match = dp.ofproto_parser.OFPMatch()
         mod = dp.ofproto_parser.OFPFlowMod(datapath=dp, command=dp.ofproto.OFPFC_DELETE,
                                            out_port=dp.ofproto.OFPP_ANY, out_group=dp.ofproto.OFPG_ANY,
                                            match=match)
         dp.send_msg(mod)
-        
-        # Reinstala a regra Table-Miss, senão o switch fica mudo.
+        # Correção: Reinstala Table-Miss
         self.add_table_miss_flow(dp)
-        
-        # 3. Limpa MACs aprendidos
         if dp.id in self.mac_to_port:
             self.mac_to_port[dp.id] = {}
 
@@ -76,7 +86,9 @@ class SimpleSwitchFixed(app_manager.RyuApp):
         self.port_state[dpid_str][port_no] = state
         
         if state == stplib.PORT_STATE_FORWARD:
-             self.logger.info(f"🟢 LIBERADO: Switch {dpid_str} Porta {port_no} -> FORWARD")
+             self.logger.info(f"🟢 LIBERADO: Switch {dpid_str} Porta {port_no}")
+        elif state == stplib.PORT_STATE_BLOCK:
+             self.logger.info(f"⛔ BLOQUEADO: Switch {dpid_str} Porta {port_no}")
 
     @set_ev_cls(stplib.EventPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -93,14 +105,9 @@ class SimpleSwitchFixed(app_manager.RyuApp):
 
         dpid_str = dpid_lib.dpid_to_str(dpid)
         
-        # Log para provar que o pacote chegou (Debug)
-        if pkt.get_protocol(arp.arp):
-            self.logger.info(f"📨 PacketIn: ARP em {dpid_str} porta {in_port}")
-
-        # Ingress Check (Bloqueia entrada em portas proibidas pelo STP)
+        # Ingress Check
         if dpid_str in self.port_state:
             state = self.port_state[dpid_str].get(in_port)
-            # Se a porta for BLOCK ou LISTEN, dropa. Se for None (Host), deixa passar.
             if state == stplib.PORT_STATE_BLOCK or state == stplib.PORT_STATE_LISTEN:
                  return 
         
@@ -114,7 +121,6 @@ class SimpleSwitchFixed(app_manager.RyuApp):
             out_port = self.mac_to_port[dpid][dst]
 
         actions = []
-        
         if out_port == ofproto.OFPP_FLOOD:
             actions.append(parser.OFPActionOutput(ofproto.OFPP_FLOOD))
         else:
@@ -123,7 +129,6 @@ class SimpleSwitchFixed(app_manager.RyuApp):
                 dst_state = self.port_state[dpid_str].get(out_port)
                 if dst_state == stplib.PORT_STATE_BLOCK or dst_state == stplib.PORT_STATE_LISTEN:
                     allow_out = False
-            
             if allow_out:
                 actions.append(parser.OFPActionOutput(out_port))
 
