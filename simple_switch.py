@@ -1,5 +1,5 @@
-# simple_switch_route.py
-# Força rota SUPERIOR (s1-s2-s4) manipulando prioridades do STP.
+# simple_switch_lower.py
+# Força rota INFERIOR (s1-s3-s4) manipulando prioridades do STP.
 # Mantém correções de "Table-Miss" e "Flood Nativo".
 
 from ryu.base import app_manager
@@ -10,32 +10,31 @@ from ryu.lib.packet import packet, ethernet, arp
 from ryu.lib import stplib
 from ryu.lib import dpid as dpid_lib
 
-class SimpleSwitchRoute(app_manager.RyuApp):
+class SimpleSwitchRouteLower(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _CONTEXTS = {'stplib': stplib.Stp}
 
     def __init__(self, *args, **kwargs):
-        super(SimpleSwitchRoute, self).__init__(*args, **kwargs)
+        super(SimpleSwitchRouteLower, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.stp = kwargs['stplib']
         self.port_state = {}
 
-        # --- CONFIGURAÇÃO DE ROTA FORÇADA ---
-        # Lógica: O STP escolhe o caminho através dos switches com menor prioridade.
-        # S1 (0x1000): Raiz Absoluta.
-        # S2 (0x2000): Prioridade Alta -> STP vai preferir este caminho.
-        # S3 (0x9000): Prioridade Baixa -> STP vai evitar/bloquear este caminho.
+        # --- CONFIGURAÇÃO DE ROTA INFERIOR ---
+        # Regra: Menor valor = Maior Prioridade no STP.
+        # S1 (0x1000): Raiz.
+        # S3 (0x2000): Prioridade ALTA. O STP vai preferir passar por aqui.
+        # S2 (0x9000): Prioridade BAIXA (Pior). O STP vai bloquear este lado.
         # S4 (0x8000): Padrão.
-        # Resultado: O fluxo fluirá S1 -> S2 -> S4.
         
         config = {
             dpid_lib.str_to_dpid('0000000000000001'): {'bridge': {'priority': 0x1000}},
-            dpid_lib.str_to_dpid('0000000000000002'): {'bridge': {'priority': 0x2000}},
-            dpid_lib.str_to_dpid('0000000000000003'): {'bridge': {'priority': 0x9000}},
+            dpid_lib.str_to_dpid('0000000000000002'): {'bridge': {'priority': 0x9000}}, # Bloqueia s2
+            dpid_lib.str_to_dpid('0000000000000003'): {'bridge': {'priority': 0x2000}}, # Prioriza s3
             dpid_lib.str_to_dpid('0000000000000004'): {'bridge': {'priority': 0x8000}}
         }
         self.stp.set_config(config)
-        self.logger.info(">>> ROTA FORÇADA: S1 -> S2 -> S4 (Via Prioridades STP) <<<")
+        self.logger.info(">>> ROTA FORÇADA: S1 -> S3 -> S4 (INFERIOR) <<<")
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -50,7 +49,6 @@ class SimpleSwitchRoute(app_manager.RyuApp):
         datapath.send_msg(mod)
 
     def add_table_miss_flow(self, datapath):
-        """Reinstala regra para enviar pacotes desconhecidos ao controlador"""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         match = parser.OFPMatch()
@@ -66,13 +64,11 @@ class SimpleSwitchRoute(app_manager.RyuApp):
     @set_ev_cls(stplib.EventTopologyChange, MAIN_DISPATCHER)
     def _topology_change_handler(self, ev):
         dp = ev.dp
-        # Limpa fluxos
         match = dp.ofproto_parser.OFPMatch()
         mod = dp.ofproto_parser.OFPFlowMod(datapath=dp, command=dp.ofproto.OFPFC_DELETE,
                                            out_port=dp.ofproto.OFPP_ANY, out_group=dp.ofproto.OFPG_ANY,
                                            match=match)
         dp.send_msg(mod)
-        # Correção: Reinstala Table-Miss
         self.add_table_miss_flow(dp)
         if dp.id in self.mac_to_port:
             self.mac_to_port[dp.id] = {}
@@ -105,7 +101,6 @@ class SimpleSwitchRoute(app_manager.RyuApp):
 
         dpid_str = dpid_lib.dpid_to_str(dpid)
         
-        # Ingress Check
         if dpid_str in self.port_state:
             state = self.port_state[dpid_str].get(in_port)
             if state == stplib.PORT_STATE_BLOCK or state == stplib.PORT_STATE_LISTEN:
